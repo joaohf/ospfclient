@@ -1,5 +1,7 @@
 -module(ospfclient).
 
+-feature(maybe_expr, enable).
+
 -export([
     connect/1, connect/2,
     close/1,
@@ -24,6 +26,8 @@
 -define(ASYNCPORT, 4000).
 
 -define(APIMSGHDR, 8).
+
+-define(RETRY_CONNECT_TIMEOUT, 3000).
 
 % ------------------------
 % Messages to OSPF daemon.
@@ -119,10 +123,12 @@
 -record(ospfclient, {
     host :: socket:in_addr(),
     port = ?ASYNCPORT :: non_neg_integer(),
-    fd_sync :: undefined | socket:socket(),
-    fd_async :: undefined | socket:socket(),
+    fd_sync = undefined :: undefined | socket:socket(),
+    fd_async = undefined :: undefined | socket:socket(),
     seqnr = 0 :: non_neg_integer(),
-    async_pid :: undefined | pid()
+    async_pid = undefined :: undefined | pid(),
+    async_callbacks = #{} :: map(),
+    async_callback_data = undefined :: any()
 }).
 
 -record(apimsghdr, {version, msgtype, msglen, msgseq}).
@@ -284,68 +290,75 @@ nsm_name(?NSM_FULL) ->
     "NSM_FULL".
 
 init(Host, Opts, Cpid) ->
-    State = #ospfclient{host = Host},
     AsyncCallbacks = proplists:get_value(callbacks, Opts, #{}),
     AsyncCallbackData = proplists:get_value(callback_data, Opts, undefined),
+    State = #ospfclient{
+        host = Host, async_callbacks = AsyncCallbacks, async_callback_data = AsyncCallbackData
+    },
 
-    case try_connect(Host, State) of
-        {ok, State0} ->
-            AsyncPid = spawn_link(fun() ->
-                async_init(State0#ospfclient.fd_async, AsyncCallbacks, AsyncCallbackData)
-            end),
+    % We will not block the caller
+    send(Cpid, {ok, self()}),
 
-            send(Cpid, {ok, self()}),
-            ?MODULE:loop(Cpid, State0#ospfclient{async_pid = AsyncPid});
-        Else ->
-            send(Cpid, Else),
-            unlink(Cpid),
-            exit(Else)
-    end.
+    % Send connect to itself in order to start connection procedures
+    send(self(), connect),
+
+    ?MODULE:loop(Cpid, State).
 
 async_init(AsyncSocket, Callbacks, AsyncCallbackData) ->
     ?MODULE:async_loop(AsyncSocket, Callbacks, AsyncCallbackData).
 
-try_connect(Host, State) ->
-    try do_connect(Host, State) of
+try_connect(Cpid, State) ->
+    case do_connect(State) of
         {ok, FdSync, FdAsync} ->
-            {ok, State#ospfclient{host = Host, fd_sync = FdSync, fd_async = FdAsync}}
-        % TODO: implement retry
-        % Err ->
-        %     io:format("Connect: ~p failed ~p~n", [Host, Err]),
-        %     try_connect(Host, State)
-    catch
-        _:Err:Stk ->
-            io:format("Connect: ~p failed ~p ~p~n", [Host, Err, Stk]),
-            %try_connect(Host, Data),
-            {error, "connect failed"}
+            AsyncPid = spawn_link(fun() ->
+                async_init(
+                    State#ospfclient.fd_async,
+                    State#ospfclient.async_callbacks,
+                    State#ospfclient.async_callback_data
+                )
+            end),
+            ?MODULE:loop(Cpid, State#ospfclient{
+                async_pid = AsyncPid, fd_sync = FdSync, fd_async = FdAsync
+            });
+        {error, not_connected, Reason} ->
+            timer:sleep(?RETRY_CONNECT_TIMEOUT),
+            io:format("Connect: ~p failed ~p~n", [State#ospfclient.host, Reason]),
+            send(self(), connect),
+            ?MODULE:loop(Cpid, State)
     end.
 
-do_connect(Host, State) ->
+do_connect(State) ->
+    Host = State#ospfclient.host,
     SyncPort = State#ospfclient.port,
-
     AsyncSockAddr = #{family => inet, addr => any, port => SyncPort + 1},
-    {ok, AsyncServerSocket} = socket:open(inet, stream, tcp),
-    ok = socket:setopt(AsyncServerSocket, {socket, reuseaddr}, true),
-    ok = socket:bind(AsyncServerSocket, AsyncSockAddr),
-    ok = socket:listen(AsyncServerSocket),
-
-    % Make a connection for synchronous requests and connect to server
-    {ok, SyncSocket} = socket:open(inet, stream, tcp),
-    ok = socket:setopt(SyncSocket, {socket, reuseaddr}, true),
-    SockAddr = #{family => inet, addr => any, port => SyncPort},
-    ok = socket:bind(SyncSocket, SockAddr),
-    ok = socket:connect(SyncSocket, SockAddr#{addr => Host, port => ?OSPF_API_SYNC_PORT}),
-
-    % Accept reverse connection
-    {ok, AsyncSocket} = socket:accept(AsyncServerSocket),
-
-    % Not needed anymore
-    socket:close(AsyncServerSocket),
-
-    {ok, SyncSocket, AsyncSocket}.
+    maybe
+        {ok, AsyncServerSocket} ?= socket:open(inet, stream, tcp),
+        ok ?= socket:setopt(AsyncServerSocket, {socket, reuseaddr}, true),
+        ok ?= socket:bind(AsyncServerSocket, AsyncSockAddr),
+        ok ?= socket:listen(AsyncServerSocket),
+        % Make a connection for synchronous requests and connect to server
+        {ok, SyncSocket} ?= socket:open(inet, stream, tcp),
+        ok ?= socket:setopt(SyncSocket, {socket, reuseaddr}, true),
+        SockAddr = #{family => inet, addr => any, port => SyncPort},
+        ok ?= socket:bind(SyncSocket, SockAddr),
+        ok ?= socket:connect(SyncSocket, SockAddr#{addr => Host, port => ?OSPF_API_SYNC_PORT}),
+        % Accept reverse connection
+        {ok, AsyncSocket} ?= socket:accept(AsyncServerSocket),
+        % Not needed anymore
+        ok ?= socket:close(AsyncServerSocket),
+        {ok, SyncSocket, AsyncSocket}
+    else
+        {error, Reason} ->
+            {error, not_connected, Reason}
+    end.
 
 loop(Cpid, State) ->
     receive
+        {_From, close} ->
+            do_close(Cpid, State);
+        {_From, connect} ->
+            % It is not suppose to give up
+            try_connect(Cpid, State);
         {_From, {sync_lsdb, LSAFilter}} ->
             State0 = do_sync_lsdb(LSAFilter, State),
             ?MODULE:loop(Cpid, State0);
@@ -360,9 +373,7 @@ loop(Cpid, State) ->
             ?MODULE:loop(Cpid, State0);
         {_From, sync_reachable} ->
             State0 = do_sync_reachable(State),
-            ?MODULE:loop(Cpid, State0);
-        {_From, close} ->
-            do_close(Cpid, State)
+            ?MODULE:loop(Cpid, State0)
     end.
 
 async_loop(Socket, Callbacks, AsyncCallbackData) ->
@@ -384,19 +395,24 @@ async_loop(Socket, Callbacks, AsyncCallbackData) ->
     ?MODULE:async_loop(Socket, Callbacks, AsyncCallbackData).
 
 do_close(Cpid, #ospfclient{async_pid = AsyncPid, fd_sync = FdSync, fd_async = FdAsync}) ->
-    erlang:unlink(AsyncPid),
-    erlang:exit(AsyncPid, closed),
-    case socket:close(FdAsync) of
-        ok ->
-            ok;
+    case AsyncPid of
+        AsyncPid when is_pid(AsyncPid) ->
+            erlang:unlink(AsyncPid),
+            erlang:exit(AsyncPid, closed);
         _ ->
             ok
     end,
-    case socket:close(FdSync) of
-        ok ->
+    case FdAsync of
+        undefined ->
             ok;
-        _ ->
-            ok
+        FdAsync ->
+            _ = socket:close(FdAsync)
+    end,
+    case FdSync of
+        undefined ->
+            ok;
+        FdSync ->
+            socket:close(FdSync)
     end,
     erlang:unlink(Cpid),
     erlang:exit(normal).
