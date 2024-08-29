@@ -16,6 +16,7 @@
 
 -export([loop/2, async_loop/3]).
 
+-include_lib("kernel/include/logger.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
 -include("ospfclient.hrl").
@@ -322,7 +323,7 @@ try_connect(Cpid, State) ->
             });
         {error, not_connected, Reason} ->
             timer:sleep(?RETRY_CONNECT_TIMEOUT),
-            io:format("Connect: ~p failed ~p~n", [State#ospfclient.host, Reason]),
+            ?LOG_WARNING("Connect: ~p failed ~p~n", [State#ospfclient.host, Reason]),
             send(self(), connect),
             ?MODULE:loop(Cpid, State)
     end.
@@ -386,9 +387,9 @@ async_loop(Socket, Callbacks, AsyncCallbackData) ->
 
     case maps:get(Mt, Callbacks, undefined) of
         undefined ->
-            io:format("Handle not available for ~s payload ~p~n", [MsgName, M]);
+            ?LOG_DEBUG("Handle not available for ~s payload ~p~n", [MsgName, M]);
         Callback ->
-            io:format("RECV msg ~p/~p~n", [Mt, MsgType]),
+            ?LOG_DEBUG("RECV msg ~p/~p~n", [Mt, MsgType]),
             catch (Callback(MsgName, M, AsyncCallbackData))
     end,
 
