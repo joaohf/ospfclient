@@ -122,7 +122,7 @@
     fd_sync :: undefined | socket:socket(),
     fd_async :: undefined | socket:socket(),
     seqnr = 0 :: non_neg_integer(),
-    async_pid :: pid()
+    async_pid :: undefined | pid()
 }).
 
 -record(apimsghdr, {version, msgtype, msglen, msgseq}).
@@ -284,7 +284,7 @@ nsm_name(?NSM_FULL) ->
     "NSM_FULL".
 
 init(Host, Opts, Cpid) ->
-    State = #ospfclient{},
+    State = #ospfclient{host = Host},
     AsyncCallbacks = proplists:get_value(callbacks, Opts, #{}),
     AsyncCallbackData = proplists:get_value(callback_data, Opts, undefined),
 
@@ -308,10 +308,11 @@ async_init(AsyncSocket, Callbacks, AsyncCallbackData) ->
 try_connect(Host, State) ->
     try do_connect(Host, State) of
         {ok, FdSync, FdAsync} ->
-            {ok, State#ospfclient{host = Host, fd_sync = FdSync, fd_async = FdAsync}};
-        Err ->
-            io:format("Connect: ~p failed ~p~n", [Host, Err]),
-            try_connect(Host, State)
+            {ok, State#ospfclient{host = Host, fd_sync = FdSync, fd_async = FdAsync}}
+        % TODO: implement retry
+        % Err ->
+        %     io:format("Connect: ~p failed ~p~n", [Host, Err]),
+        %     try_connect(Host, State)
     catch
         _:Err:Stk ->
             io:format("Connect: ~p failed ~p ~p~n", [Host, Err, Stk]),
