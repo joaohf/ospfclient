@@ -55,12 +55,21 @@ The module `ospfclient` spawns two erlang process responsible for handle sync an
 * sync messages are to OSPF daemon
 * async messages are messages from OSPF daemon
 
-The sync and async process are linked for safe reasons.
+The sync and async process are linked for safe reasons. Each process manages a specific Socket.
 
 ```mermaid
 flowchart LR
     sync((Sync))-. link .-async((Async))
 ```
+
+There is a small connection protocol in order to get the async socket working:
+
+* 4001/tcp port is open and waits for connection from OSPF daemon, this is the async socket
+* next, a connection is made to OSPF daemon through dest 2607/tcp port and having the port 4000/tcp as source port
+* the OSPF daemon receives the connection and also makes another connection to ospfclient which is listening connections to 4001/tcp port
+* now both sockets are up and running.
+
+The function `ospfclient:do_connect/2` is responsible for implementing that logic.
 
 When calling: `ospfclient:connect/1` function, the caller receives back a Handle. That handle (which is a process id) should be used for further interactions with ospfclient.
 
@@ -74,12 +83,17 @@ Build
 Test Environment
 ----------------
 
-TBW, I want to provide here my configurations for virtual test environment with FRRouting.
+There is no secret and all what we need is some FRR hosts in order to configure OSPF routes. My environment
+was made using 3 virtual machines with Ubuntu 24 and FF installed from packages. Then I made OSPF configuration
+and connect to one of virtual hosts. That is all.
 
 Test
 ----
 
-    $ rebar3 as test
+This project does not support unit test yet. It's a challenge to implement tests because it depends on
+FRR ospf daemon.
+
+    $ rebar3 as test shell
     Erlang/OTP 26 [erts-14.2.5] [source] [64-bit] [smp:32:12] [ds:32:12:10] [async-threads:1] [jit:ns]
 
     Eshell V14.2.5 (press Ctrl+G to abort, type help(). for help)
