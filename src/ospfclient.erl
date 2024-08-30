@@ -313,7 +313,7 @@ try_connect(Cpid, State) ->
         {ok, FdSync, FdAsync} ->
             AsyncPid = spawn_link(fun() ->
                 async_init(
-                    State#ospfclient.fd_async,
+                    FdAsync,
                     State#ospfclient.async_callbacks,
                     State#ospfclient.async_callback_data
                 )
@@ -332,25 +332,42 @@ do_connect(State) ->
     Host = State#ospfclient.host,
     SyncPort = State#ospfclient.port,
     AsyncSockAddr = #{family => inet, addr => any, port => SyncPort + 1},
-    maybe
-        {ok, AsyncServerSocket} ?= socket:open(inet, stream, tcp),
-        ok ?= socket:setopt(AsyncServerSocket, {socket, reuseaddr}, true),
-        ok ?= socket:bind(AsyncServerSocket, AsyncSockAddr),
-        ok ?= socket:listen(AsyncServerSocket),
-        % Make a connection for synchronous requests and connect to server
-        {ok, SyncSocket} ?= socket:open(inet, stream, tcp),
-        ok ?= socket:setopt(SyncSocket, {socket, reuseaddr}, true),
-        SockAddr = #{family => inet, addr => any, port => SyncPort},
-        ok ?= socket:bind(SyncSocket, SockAddr),
-        ok ?= socket:connect(SyncSocket, SockAddr#{addr => Host, port => ?OSPF_API_SYNC_PORT}),
-        % Accept reverse connection
-        {ok, AsyncSocket} ?= socket:accept(AsyncServerSocket),
-        % Not needed anymore
-        ok ?= socket:close(AsyncServerSocket),
-        {ok, SyncSocket, AsyncSocket}
-    else
+
+    case open_sockets() of
+        {ok, AsyncServerSocket, SyncSocket} ->
+            maybe
+                ok ?= socket:setopt(AsyncServerSocket, {socket, reuseaddr}, true),
+                ok ?= socket:bind(AsyncServerSocket, AsyncSockAddr),
+                ok ?= socket:listen(AsyncServerSocket),
+                % Make a connection for synchronous requests and connect to server
+                ok ?= socket:setopt(SyncSocket, {socket, reuseaddr}, true),
+                SockAddr = #{family => inet, addr => any, port => SyncPort},
+                ok ?= socket:bind(SyncSocket, SockAddr),
+                ok ?=
+                    socket:connect(SyncSocket, SockAddr#{addr => Host, port => ?OSPF_API_SYNC_PORT}),
+                % Accept reverse connection
+                {ok, AsyncSocket} ?= socket:accept(AsyncServerSocket, 3000),
+                % Not needed anymore
+                ok ?= socket:close(AsyncServerSocket),
+                {ok, SyncSocket, AsyncSocket}
+            else
+                {error, Reason} ->
+                    ok = socket:close(AsyncServerSocket),
+                    ok = socket:close(SyncSocket),
+                    {error, not_connected, Reason}
+            end;
         {error, Reason} ->
             {error, not_connected, Reason}
+    end.
+
+open_sockets() ->
+    maybe
+        {ok, S0} ?= socket:open(inet, stream, tcp),
+        {ok, S1} ?= socket:open(inet, stream, tcp),
+        {ok, S0, S1}
+    else
+        {error, Reason0} ->
+            {error, Reason0}
     end.
 
 loop(Cpid, State) ->
